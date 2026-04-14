@@ -31,6 +31,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlsplit
 
@@ -1547,13 +1548,44 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
+    @staticmethod
+    def _payload_to_message(payload: Dict[str, Any]) -> SimpleNamespace:
+        """Normalize callback payload keys into ChatbotMessage-like attributes."""
+        normalized = dict(payload)
+        alias_map = {
+            "msgId": "message_id",
+            "senderId": "sender_id",
+            "senderStaffId": "sender_staff_id",
+            "senderNick": "sender_nick",
+            "robotCode": "robot_code",
+            "conversationId": "conversation_id",
+            "conversationType": "conversation_type",
+            "conversationTitle": "conversation_title",
+            "sessionWebhook": "session_webhook",
+            "createAt": "create_at",
+            "msgtype": "message_type",
+        }
+        for source_key, target_key in alias_map.items():
+            if source_key in payload and target_key not in normalized:
+                normalized[target_key] = payload[source_key]
+        text_value = normalized.get("text")
+        if isinstance(text_value, dict):
+            normalized["text"] = SimpleNamespace(**text_value)
+        return SimpleNamespace(**normalized)
+
     async def process(self, message):
         """Called by dingtalk-stream when a callback message arrives."""
         if DINGTALK_STREAM_AVAILABLE and isinstance(message, ChatbotMessage):
             incoming = message
         else:
             payload = getattr(message, "data", None) or {}
-            incoming = ChatbotMessage.from_dict(payload) if isinstance(payload, dict) else payload
+            if isinstance(payload, dict):
+                if DINGTALK_STREAM_AVAILABLE:
+                    incoming = ChatbotMessage.from_dict(payload)
+                else:
+                    incoming = self._payload_to_message(payload)
+            else:
+                incoming = payload
             if isinstance(payload, dict) and incoming is not None:
                 try:
                     setattr(incoming, "_raw_data", payload)
@@ -1570,3 +1602,33 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
         return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+
+    async def raw_process(self, callback):
+        """Compatibility shim for SDK callback payload processing."""
+        payload = getattr(callback, "data", None) or {}
+        if isinstance(payload, dict):
+            if DINGTALK_STREAM_AVAILABLE:
+                incoming = ChatbotMessage.from_dict(payload)
+            else:
+                incoming = self._payload_to_message(payload)
+            try:
+                setattr(incoming, "_raw_data", payload)
+            except Exception:
+                pass
+        else:
+            incoming = payload
+
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
+        else:
+            try:
+                await self._adapter._on_message(incoming)
+            except Exception:
+                logger.exception("[DingTalk] Error processing incoming callback")
+
+        if DINGTALK_STREAM_AVAILABLE and dingtalk_stream is not None:
+            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
+
+        headers = getattr(callback, "headers", None) or SimpleNamespace()
+        return SimpleNamespace(code=200, headers=headers)
